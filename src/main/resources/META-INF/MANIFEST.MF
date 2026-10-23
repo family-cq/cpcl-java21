@@ -1,0 +1,20 @@
+Manifest-Version: 1.0
+Main-Class: com.meloong.pcl.PclApplication
+Class-Path: classmate-1.7.0.jar jackson-module-parameter-names-2.17.2.ja
+ r spring-core-6.1.14.jar jackson-annotations-2.17.2.jar jackson-core-2.
+ 17.2.jar spring-webmvc-6.1.14.jar spring-expression-6.1.14.jar spring-b
+ oot-starter-3.3.5.jar spring-aop-6.1.14.jar jackson-databind-2.17.2.jar
+  log4j-to-slf4j-2.23.1.jar spring-boot-starter-tomcat-3.3.5.jar spring-
+ beans-6.1.14.jar spring-web-6.1.14.jar jul-to-slf4j-2.0.16.jar snakeyam
+ l-2.2.jar slf4j-api-2.0.16.jar log4j-api-2.23.1.jar tomcat-embed-websoc
+ ket-10.1.31.jar spring-boot-3.3.5.jar tomcat-embed-core-10.1.31.jar tom
+ cat-embed-el-10.1.31.jar jackson-datatype-jsr310-2.17.2.jar spring-cont
+ ext-6.1.14.jar spring-boot-starter-validation-3.3.5.jar micrometer-obse
+ rvation-1.13.6.jar jakarta.validation-api-3.0.2.jar spring-boot-starter
+ -web-3.3.5.jar jackson-datatype-jdk8-2.17.2.jar hibernate-validator-8.0
+ .1.Final.jar spring-jcl-6.1.14.jar logback-classic-1.5.11.jar spring-bo
+ ot-autoconfigure-3.3.5.jar micrometer-commons-1.13.6.jar jakarta.annota
+ tion-api-2.1.1.jar spring-boot-starter-json-3.3.5.jar spring-boot-confi
+ guration-processor-3.3.5.jar logback-core-1.5.11.jar spring-boot-starte
+ r-logging-3.3.5.jar jboss-logging-3.5.3.Final.jar
+

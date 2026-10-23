@@ -1,0 +1,40 @@
+# ================= 构建产物 =================
+target/
+out/
+cpcl/
+dist/
+*.jar
+*.war
+
+# ================= 运行时数据（存档/设置/缓存/日志）=================
+# 7GB 的 .minecraft，绝对不要提交
+.minecraft/
+demo-mc/
+data/
+cache/
+logs/
+*.log
+*.log.*
+
+# ================= 临时文件 =================
+tmp/
+*.tmp
+*.bak
+*.swp
+*~
+
+# ================= IDE =================
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+
+# ================= 系统 =================
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ================= 本地覆盖配置 =================
+application-local.yml
+application-local.properties

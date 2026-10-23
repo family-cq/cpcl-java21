@@ -1,0 +1,46 @@
+server:
+  port: 18080
+  servlet:
+    encoding:
+      charset: UTF-8
+      force: true
+
+spring:
+  application:
+    name: pcl-java21
+  jackson:
+    default-property-inclusion: non_null
+  servlet:
+    multipart:
+      # 整合包上传（有的包 1GB+）
+      max-file-size: 2GB
+      max-request-size: 2GB
+  mvc:
+    problemdetails:
+      enabled: false
+
+pcl:
+  # 数据目录（设置、缓存、日志）；留空 = 启动器所在目录，不会写到 C 盘
+  data-dir: ${PCL_DATA_DIR:}
+  # .minecraft 根目录；留空 = 数据目录下的 .minecraft
+  minecraft-dir: ${PCL_MC_DIR:}
+  # 微软正版登录的 Azure 应用 ID（设备码流程），留空则正版登录不可用
+  auth-client-id: ${PCL_MS_CLIENT_ID:}
+  auth-tenant: consumers
+  launcher-name: PCL
+  launcher-version: 2.99.0.0
+  download-thread: 16
+  # auto / mirror / official
+  download-source: auto
+  # 0 表示按 PCL 的自动内存算法计算
+  default-memory-mb: 0
+  # 0 自动 / 1 保守 / 2 仅 G1GC / 3 不指定 / 4 优化 G1GC
+  gc-mode: 0
+  log4j-patch: true
+  wait-for-exit: false
+  extra-jvm-args: []
+  extra-game-args: []
+
+logging:
+  level:
+    com.meloong.pcl: info
