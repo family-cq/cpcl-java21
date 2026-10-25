@@ -29,6 +29,7 @@ public class LaunchService {
     private final VersionResolver versionResolver;
     private final LaunchCommandBuilder commandBuilder;
     private final JavaLocator javaLocator;
+    private final JavaAutoDownloader javaDownloader;
     private final GameLauncher gameLauncher;
     private final InstanceScanner instanceScanner;
     private final SettingsService settingsService;
@@ -39,13 +40,14 @@ public class LaunchService {
 
     public LaunchService(PclProperties properties, VersionResolver versionResolver,
                          LaunchCommandBuilder commandBuilder, JavaLocator javaLocator,
-                         GameLauncher gameLauncher, InstanceScanner instanceScanner,
-                         SettingsService settingsService, WindowsTweaks windowsTweaks,
-                         VersionManifestService manifestService) {
+                         JavaAutoDownloader javaDownloader, GameLauncher gameLauncher,
+                         InstanceScanner instanceScanner, SettingsService settingsService,
+                         WindowsTweaks windowsTweaks, VersionManifestService manifestService) {
         this.properties = properties;
         this.versionResolver = versionResolver;
         this.commandBuilder = commandBuilder;
         this.javaLocator = javaLocator;
+        this.javaDownloader = javaDownloader;
         this.gameLauncher = gameLauncher;
         this.instanceScanner = instanceScanner;
         this.settingsService = settingsService;
@@ -123,22 +125,50 @@ public class LaunchService {
         thread.start();
     }
 
-    private JavaRuntime selectJava(ResolvedVersion version, LaunchRequest request, Settings settings) {        String configured = request.javaPath() != null && !request.javaPath().isBlank()
+    private JavaRuntime selectJava(ResolvedVersion version, LaunchRequest request, Settings settings) {
+        String configured = request.javaPath() != null && !request.javaPath().isBlank()
                 ? request.javaPath()
                 : settings.advanced.javaPath;
         if (configured != null && !configured.isBlank()) {
             JavaRuntime java = javaLocator.findByPath(configured);
             if (java.available()) {
-                return java;
+                if (usesLaunchWrapper(version) && java.major() != 8) {
+                    log.warn("设置指定的 Java {} 与 launchwrapper 不兼容（必须 Java 8），改用自动选择", java);
+                } else {
+                    return java;
+                }
+            } else {
+                log.warn("设置中的 Java 不可用，回退到自动选择：{}", configured);
             }
-            log.warn("设置中的 Java 不可用，回退到自动选择：{}", configured);
         }
+        boolean launchWrapper = usesLaunchWrapper(version);
         int required = version.requiredJavaMajor();
-        JavaRuntime java = javaLocator.findBest(required);
-        if (java != null) {
-            log.info("自动选择 {}（版本要求 Java {}）", java, required);
+        JavaRuntime java;
+        if (launchWrapper) {
+            // launchwrapper 把应用类加载器强转 URLClassLoader，只有 Java 8 上成立，
+            // Java 9+ 直接 ClassCastException（用户遇到的启动报错就是这个）
+            java = javaLocator.findExact(8);
+            if (java == null) {
+                log.info("launchwrapper 版本需要 Java 8，本机没有，尝试自动下载…");
+                java = javaDownloader.ensureJava8();
+            }
+            if (java == null) {
+                throw new IllegalStateException(
+                        "1.7.10～1.12.2 的 Forge / 整合包用 launchwrapper 启动，只能用 Java 8（Java 11/17/21 都会报 "
+                                + "ClassCastException）。自动下载 Java 8 失败，请检查网络后在设置里手动添加 Java 8。");
+            }
+            log.info("launchwrapper 版本，使用 Java 8：{}", java);
+        } else {
+            java = javaLocator.findBest(required);
+            if (java != null) {
+                log.info("自动选择 {}（版本要求 Java {}）", java, required);
+            }
         }
         return java;
+    }
+
+    private static boolean usesLaunchWrapper(ResolvedVersion version) {
+        return version.mainClass() != null && version.mainClass().contains("net.minecraft.launchwrapper");
     }
 
     private LaunchOptions toOptions(String instanceId, LaunchRequest request, Settings settings, boolean isolate) {

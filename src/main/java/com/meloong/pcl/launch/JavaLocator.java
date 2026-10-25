@@ -302,6 +302,14 @@ public class JavaLocator {
                 .orElse(list.get(list.size() - 1));
     }
 
+    /** 精确找某个主版本的 Java（launchwrapper 类版本只能用 Java 8，高了直接崩）。 */
+    public JavaRuntime findExact(int major) {
+        return candidates().stream()
+                .filter(java -> java.major() == major)
+                .findFirst()
+                .orElse(null);
+    }
+
     public JavaRuntime findByPath(String executablePath) {
         Path path = Paths.get(executablePath);
         JavaRuntime runtime = Files.isDirectory(path)
