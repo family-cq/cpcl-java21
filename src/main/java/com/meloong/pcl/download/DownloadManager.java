@@ -50,11 +50,28 @@ public class DownloadManager {
      * 因此下载优先用系统 curl.exe，不可用时回退 Java HttpClient。
      */
     private static final Path CURL = locateCurl();
+    /** 丢弃输出的空设备（probe 时避免把响应体写进工作目录）。 */
+    private static final String NULL_DEVICE =
+            System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win") ? "NUL" : "/dev/null";
+
+    /** 小于 512KB 不分片：握手开销占比太高，反而更慢。 */
+    private static final long SEGMENT_MIN_BYTES = 512L * 1024;
+    /** 每片目标大小：1MB 以上就能开满 4 片。 */
+    private static final long SEGMENT_UNIT_BYTES = 256L * 1024;
+    private static final int SEGMENTS_MAX = 4;
+    /** 分片共享的连接上限：16 个文件 × 4 片会把链路打满，统一限流。 */
+    private static final int MAX_CONNECTIONS = 48;
 
     private final PclProperties properties;
     private final DownloadSources sources;
     private final HttpClient httpClient;
     private final ExecutorService executor;
+    /** 分片下载专用的线程池，和文件级线程池分开，避免互相等待造成死锁。 */
+    private final ExecutorService segmentPool;
+    /** 分片连接信号量，限制同时存在的 curl 分片进程数。 */
+    private final java.util.concurrent.Semaphore connections = new java.util.concurrent.Semaphore(MAX_CONNECTIONS);
+    /** CDN 静态资源几乎不变，同一次安装里同一地址只探测一次。 */
+    private final java.util.Map<String, Probe> probeCache = new ConcurrentHashMap<>();
 
     /** 正在下载中的临时文件，采样线程按文件体积增量估算实时网速。 */
     private final Set<Path> activeTemps = ConcurrentHashMap.newKeySet();
@@ -72,8 +89,13 @@ public class DownloadManager {
             thread.setDaemon(true);
             return thread;
         });
+        this.segmentPool = Executors.newCachedThreadPool(runnable -> {
+            Thread thread = new Thread(runnable, "pcl-segment");
+            thread.setDaemon(true);
+            return thread;
+        });
         if (CURL != null) {
-            log.info("下载引擎：系统 curl（{}），规避 Java TLS 指纹被 CDN 限速", CURL);
+            log.info("下载引擎：系统 curl（{}），分片并发最多 {} 段，规避单连接限速", CURL, SEGMENTS_MAX);
         } else {
             log.info("下载引擎：Java HttpClient（未找到系统 curl）");
         }
@@ -147,6 +169,7 @@ public class DownloadManager {
     @PreDestroy
     void shutdown() {
         executor.shutdownNow();
+        segmentPool.shutdownNow();
     }
 
     /** 批量下载。 */
@@ -252,7 +275,10 @@ public class DownloadManager {
         activeTemps.add(temp);
         try {
             if (CURL != null) {
-                fetchByCurl(url, temp);
+                // 先试分片并发（CDN 单连接限速时能快 3 倍），失败再退回单连接整文件下载
+                if (!fetchSegmented(url, temp, file)) {
+                    fetchByCurl(url, temp);
+                }
             } else {
                 doFetch(url, temp);
             }
@@ -269,6 +295,223 @@ public class DownloadManager {
         long size = Files.size(temp);
         Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
         return size;
+    }
+
+    /** 探测结果：跳转后的真实地址、文件总大小、是否支持 Range。 */
+    record Probe(String url, long length, boolean ranges) {
+    }
+
+    /**
+     * 分片并发下载，思路同 PCL：CDN 对单连接限速，多连接能叠加速度。
+     *
+     * <p>实测 forgecdn 单连接 275 KB/s、4 连接合计 860 KB/s（约 3 倍）。
+     * 注意 edge.forgecdn.net 会 302 跳到 mediafilez.forgecdn.net，而 Range 只有最终地址
+     * 才认（直接对 edge 发 Range 会 404），所以必须先探测拿真实地址再分片。
+     *
+     * @return true 表示已完整写入 temp；false 表示不满足分片条件或失败，由调用方退回单连接
+     */
+    private boolean fetchSegmented(String url, Path temp, NetFile file) throws InterruptedException {
+        Probe probe = probe(url);
+        if (probe == null || !probe.ranges() || probe.length() <= 0) {
+            return false;
+        }
+        long size = file.size() > 0 ? file.size() : probe.length();
+        if (size < SEGMENT_MIN_BYTES) {
+            return false;
+        }
+        if (file.size() > 0 && file.size() != probe.length()) {
+            // 清单大小与服务器不一致（多半镜像文件不同），交给单连接整文件去校验
+            return false;
+        }
+        int segments = (int) Math.min(SEGMENTS_MAX, Math.max(2, size / SEGMENT_UNIT_BYTES));
+        log.debug("{} 分片下载：{} 字节 / {} 段（{}）", file.description(), size, segments, probe.url());
+        long per = (size + segments - 1) / segments;
+        List<Path> parts = new ArrayList<>(segments);
+        List<Future<?>> futures = new ArrayList<>(segments);
+        try {
+            for (int i = 0; i < segments; i++) {
+                long start = i * per;
+                if (start >= size) {
+                    break;
+                }
+                long end = Math.min(size - 1, start + per - 1);
+                Path part = temp.resolveSibling(temp.getFileName() + ".p" + i);
+                parts.add(part);
+                futures.add(segmentPool.submit(() -> {
+                    downloadRange(probe.url(), part, start, end);
+                    return null;
+                }));
+            }
+            for (Future<?> future : futures) {
+                future.get();
+            }
+            try (var out = Files.newOutputStream(temp)) {
+                for (Path part : parts) {
+                    Files.copy(part, out);
+                }
+            }
+            if (Files.size(temp) != size) {
+                throw new IOException("分片拼接后大小不符");
+            }
+            log.debug("分片下载完成：{}（{} 段，{} 字节）", file.description(), parts.size(), size);
+            return true;
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw ex;
+        } catch (Exception ex) {
+            log.warn("分片下载失败，改用单连接（{}）：{}", url, ex.getMessage());
+            return false;
+        } finally {
+            for (Path part : parts) {
+                try {
+                    Files.deleteIfExists(part);
+                } catch (IOException ignored) {
+                    // 清理失败不影响主流程
+                }
+            }
+        }
+    }
+
+    /** 下载一个字节区间到独立分片文件，大小对不上即判失败。 */
+    private void downloadRange(String url, Path part, long start, long end) throws IOException, InterruptedException {
+        connections.acquire();
+        try {
+            Files.deleteIfExists(part);
+            ProcessBuilder builder = new ProcessBuilder(
+                    CURL.toString(),
+                    "--fail", "--silent", "--show-error",
+                    "--connect-timeout", "15",
+                    "--speed-time", "30", "--speed-limit", "4096",
+                    "--max-time", "600",
+                    "--range", start + "-" + end,
+                    "--output", part.toString(),
+                    "--user-agent", userAgent(),
+                    safeUri(url).toString());
+            builder.redirectErrorStream(true);
+            Process process = builder.start();
+            String output;
+            try (InputStream in = process.getInputStream()) {
+                output = new String(in.readAllBytes(), StandardCharsets.UTF_8).trim();
+            }
+            int code = process.waitFor();
+            long expected = end - start + 1;
+            if (code != 0 || !Files.isRegularFile(part) || Files.size(part) != expected) {
+                throw new IOException("分片 " + start + "-" + end + " 失败（curl 退出码 " + code + "）"
+                        + (output.isBlank() ? "" : "：" + output));
+            }
+        } finally {
+            connections.release();
+        }
+    }
+
+    /**
+     * 探测真实地址、大小与 Range 支持：先用 HEAD（不耗流量），拿不到大小再用 Range 0-0 兜底。
+     * 同一次安装里同一地址只探测一次。
+     */
+    private Probe probe(String url) {
+        Probe cached = probeCache.get(url);
+        if (cached != null) {
+            return cached;
+        }
+        Probe probe = probeOnce(url, true);
+        if (probe == null) {
+            probe = probeOnce(url, false);
+        }
+        if (probe != null) {
+            probeCache.put(url, probe);
+        }
+        return probe;
+    }
+
+    private Probe probeOnce(String url, boolean head) {
+        try {
+            List<String> cmd = new ArrayList<>(List.of(
+                    CURL.toString(), "--silent", "--show-error", "--location",
+                    "--connect-timeout", "10", "--max-time", "20"));
+            if (head) {
+                cmd.add("--head");
+            } else {
+                // 服务器不支持 HEAD 时才走这里：只取 1 字节，顺带确认 Range 是否可用
+                cmd.addAll(List.of("--range", "0-0"));
+            }
+            cmd.addAll(List.of(
+                    "--dump-header", "-",
+                    "--output", NULL_DEVICE,
+                    "--write-out", "%{url_effective}",
+                    "--user-agent", userAgent(),
+                    safeUri(url).toString()));
+            ProcessBuilder builder = new ProcessBuilder(cmd);
+            builder.redirectErrorStream(true);
+            Process process = builder.start();
+            String output;
+            try (InputStream in = process.getInputStream()) {
+                output = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            }
+            if (process.waitFor() != 0) {
+                return null;
+            }
+            return parseProbe(url, output);
+        } catch (IOException | InterruptedException ex) {
+            if (ex instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            return null;
+        }
+    }
+
+    /** 解析 probe 的 stdout：末尾是有效地址，最后一组响应头里取长度与 Range 支持。 */
+    static Probe parseProbe(String original, String output) {
+        String effective = original;
+        long length = -1;
+        boolean ranges = false;
+        boolean fromRange = false;
+        boolean fresh = false;
+        for (String raw : output.split("\\R")) {
+            String line = raw.trim();
+            if (line.startsWith("HTTP/")) {
+                // 出现新的状态行说明是跳转后的响应，前面的头作废
+                fresh = true;
+                length = -1;
+                ranges = false;
+                fromRange = false;
+                continue;
+            }
+            String lower = line.toLowerCase(Locale.ROOT);
+            if (fresh && lower.startsWith("content-range:")) {
+                int slash = line.lastIndexOf('/');
+                if (slash > 0) {
+                    try {
+                        length = Long.parseLong(line.substring(slash + 1).trim());
+                        ranges = true;
+                        fromRange = true;
+                    } catch (NumberFormatException ignored) {
+                        // 形如 bytes 0-0/* 的未知长度
+                    }
+                }
+            } else if (fresh && lower.startsWith("content-length:")) {
+                try {
+                    long value = Long.parseLong(line.substring(line.indexOf(':') + 1).trim());
+                    // Content-Range 里的总长度更权威（此处 Content-Length 只是分片长度）
+                    if (value > 0 && !fromRange) {
+                        length = value;
+                    }
+                } catch (NumberFormatException ignored) {
+                    // 忽略畸形头
+                }
+            } else if (fresh && lower.startsWith("accept-ranges:")) {
+                ranges = ranges || lower.contains("bytes");
+            } else if (line.startsWith("http")) {
+                effective = line;
+            }
+        }
+        if (length <= 0) {
+            return null;
+        }
+        return new Probe(effective, length, ranges);
+    }
+
+    private String userAgent() {
+        return properties.getLauncherName() + "/" + properties.getLauncherVersion();
     }
 
     /**
