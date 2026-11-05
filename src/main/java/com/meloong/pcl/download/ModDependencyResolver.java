@@ -138,6 +138,10 @@ public class ModDependencyResolver {
     private static final int MAX_GAP_PER_ROUND = 10;
     /** 缺口候选的体积上限：只拦异常超大（100MB+）的包，本体 70MB 的 Cataclysm 必须能过。 */
     private static final long MAX_GAP_CANDIDATE_BYTES = 100L * 1024 * 1024;
+    /** 缺口包最多生成 2 个搜索词，第三个多是包名末段噪音。 */
+    private static final int MAX_GAP_QUERIES = 2;
+    /** 单个缺口最多尝试 2 个候选（含重试），都不匹配就跳过，换下一个缺口。 */
+    private static final int MAX_GAP_CANDIDATES = 2;
     private static final int MAX_ROUNDS = 4;
     /** 并行补装的线程数：每个 Mod 的候选查询与下载相互独立，串行时 16 个前置要跑五六分钟。 */
     private static final int PARALLELISM = 8;
@@ -826,7 +830,8 @@ public class ModDependencyResolver {
             if (downloadCandidate(modsDir, candidate, item.key(), item.gapPackage())) {
                 return true;
             }
-            if (++tried >= 4) {
+            if (++tried >= MAX_GAP_CANDIDATES) {
+                log.info("缺口 {} 已尝试 {} 个候选都不匹配，跳过换下一个", item.gapPackage(), tried);
                 break;
             }
         }
@@ -857,11 +862,14 @@ public class ModDependencyResolver {
         if (segs.size() > 1) {
             queries.add(segs.get(segs.size() - 1));
         }
-        log.info("缺口包 {} 转搜索词：{}", gapPackage, queries);
+        // 最多只搜 2 个搜索词：第三个往往只剩包名末段（apotheosis/ench -> ench），
+        // 搜出来基本是无关 Mod，只会把补齐拖慢
+        List<String> queryList = new ArrayList<>(new ArrayList<>(queries).subList(0, Math.min(MAX_GAP_QUERIES, queries.size())));
+        log.info("缺口包 {} 转搜索词：{}", gapPackage, queryList);
 
         List<Candidate> result = new ArrayList<>();
         // 先按 slug 直查（dev/ftb/mods/ftbquests -> ftb-quests 这种正好就是 slug）
-        for (String slugQuery : new LinkedHashSet<>(List.copyOf(queries))) {
+        for (String slugQuery : new LinkedHashSet<>(queryList)) {
             String slug = slugQuery.replace(' ', '-');
             Candidate candidate = bySlug(slug, loader, mcVersion);
             if (candidate != null) {
@@ -871,7 +879,7 @@ public class ModDependencyResolver {
                 }
             }
         }
-        for (String slug : searchSlugs(new ArrayList<>(queries), loader, mcVersion)) {
+        for (String slug : searchSlugs(queryList, loader, mcVersion)) {
             Candidate candidate = bySlug(slug, loader, mcVersion);
             if (candidate != null) {
                 result.add(candidate);
@@ -881,7 +889,7 @@ public class ModDependencyResolver {
             }
         }
         // CurseForge 兜底（cfwidget 免 Key）
-        for (String slugQuery : queries) {
+        for (String slugQuery : queryList) {
             try {
                 Candidate curse = fromCfwidget(slugQuery.replace(' ', '-'), loader, mcVersion);
                 if (curse != null) {
@@ -905,7 +913,13 @@ public class ModDependencyResolver {
     private boolean installById(Path modsDir, Missing item, String loader, String mcVersion) {
         String modId = item.key();
         Path tmp = modsDir.resolve(".pcl-dep-" + modId.replaceAll("[^A-Za-z0-9_-]", "_") + ".jar");
+        int tried = 0;
         for (Candidate candidate : candidates(modId, loader, mcVersion)) {
+            // 候选下载 + 校验最多 2 次，不匹配就跳过，避免一个前置把整轮补齐拖死
+            if (++tried > MAX_GAP_CANDIDATES) {
+                log.info("前置 Mod {} 已尝试 {} 个候选都不匹配，跳过", modId, MAX_GAP_CANDIDATES);
+                break;
+            }
             try {
                 Files.deleteIfExists(tmp);
                 DownloadManager.DownloadSummary summary = downloadManager.downloadAll(List.of(

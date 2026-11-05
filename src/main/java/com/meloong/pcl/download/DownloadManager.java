@@ -40,7 +40,9 @@ import java.util.concurrent.atomic.AtomicLong;
 public class DownloadManager {
 
     private static final Logger log = LoggerFactory.getLogger(DownloadManager.class);
-    private static final int MAX_ATTEMPTS = 3;
+    /** 失败后最多重试 2 次（含首次共 3 次尝试）；超时/失败都不再无限重试。 */
+    private static final int MAX_RETRIES = 2;
+    private static final int MAX_ATTEMPTS = MAX_RETRIES + 1;
 
     /**
      * Java JSSE 的 TLS 指纹会被 cdn.modrinth.com 的 Cloudflare 防护限速
@@ -217,22 +219,30 @@ public class DownloadManager {
             return 0;
         }
         List<String> urls = sources.resolve(file.kind(), file.url());
+        if (urls.isEmpty()) {
+            throw new IOException("没有可用的下载地址：" + file.url());
+        }
         Exception last = null;
+        // 每个文件只尝试 MAX_ATTEMPTS 次（首次 + 重试 2 次），每次尝试只打一个镜像地址，
+        // 多镜像时按顺序轮换。原实现是「每次尝试遍历所有镜像」，镜像一多就变成
+        // 3 次 × N 个地址，单个 73MB 的 Mod 能卡上半小时，故改为轮换。
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-            for (String url : urls) {
-                try {
-                    long size = fetch(url, file);
-                    return size;
-                } catch (Exception ex) {
-                    last = ex;
-                    log.debug("第 {} 次尝试失败（{}）：{}", attempt, url, ex.getMessage());
+            String url = urls.get((attempt - 1) % urls.size());
+            try {
+                long size = fetch(url, file);
+                if (attempt > 1) {
+                    log.info("{} 第 {} 次尝试成功", file.description(), attempt);
                 }
+                return size;
+            } catch (Exception ex) {
+                last = ex;
+                log.warn("{} 第 {}/{} 次尝试失败：{}", file.description(), attempt, MAX_ATTEMPTS, ex.getMessage());
             }
             if (attempt < MAX_ATTEMPTS) {
-                Thread.sleep(200L * attempt);
+                Thread.sleep(500L * attempt);
             }
         }
-        throw new IOException("多次重试后仍失败：" + (last == null ? "未知原因" : last.getMessage()), last);
+        throw new IOException("已重试 " + MAX_RETRIES + " 次仍失败：" + (last == null ? "未知原因" : last.getMessage()), last);
     }
 
     private long fetch(String url, NetFile file) throws IOException, InterruptedException {
