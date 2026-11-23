@@ -33,7 +33,7 @@
 | `McLoginMs*`（微软 OAuth）、`McLoginAuth*`（Authlib-Injector） | 需要外网 OAuth/第三方验证服务，移植版仅保留离线登录 |
 | `Launch/JavaWrapper.jar`、`LwjglUnsafeAgent.jar` | 原工程随包发布的二进制补丁，缺少源码与 jar 无法复现 |
 | `ModDownload` 的 Forge/Fabric/OptiFine 安装器 | 涉及大量安装器交互（运行 installer jar、解析日志），代码量接近整个移植工程 |
-| `ModNet` 的分片续传、下载源自动禁用、限速 | 属于传输层优化，当前实现保留并发 + 重试 + 校验 |
+| `ModNet` 的分片续传、下载源自动禁用、限速 | 传输层优化，当前实现为「分片并发 + 断点续传 + 本地复用」：0.5MB 一片、最多 12 片，慢速中断按已收字节续传（每片最多重试 2 次），下载前先在本机已有 jar 里按文件名+大小+SHA1 找同款直接复制 |
 | `ModCrash`（崩溃分析）、`ModMusic`、皮肤、帮助文档 | 与本工程目标（核心启动链路）无关 |
 | `PCLCS/Resource/*`（CurseForge/Modrinth 搜索） | 依赖第三方 API 的完整资源模型 |
 

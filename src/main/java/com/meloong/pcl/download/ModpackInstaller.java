@@ -53,8 +53,8 @@ import java.util.zip.ZipFile;
  *       解压到指定实例（无版本清单，装不进新实例）。</li>
  * </ul>
  *
- * <p>流程：解析清单 → 解压 overrides → 三条流水线并行推进
- * （① Mod 下载线 ② 游戏本体线：原版 / 加载器 / 版本 JSON ③ 前置检查线）→ 核对收尾。
+ * <p>流程：解析清单 → 解压 overrides → 两条流水线并行推进
+ * （① Mod 下载线 ② 游戏本体线：原版 / 加载器 / 版本 JSON）→ 核对收尾。
  */
 @Service
 public class ModpackInstaller {
@@ -113,14 +113,16 @@ public class ModpackInstaller {
     /**
      * 整合包安装的固定流水线。
      *
-     * <p>解压完成后，三条流水线并行推进：① Mod 下载线解析清单并下载整合包内容；
-     * ② 游戏本体线装原版 JSON / 支持库 / 资源文件与加载器；③ 前置检查线等 ① 完成后
-     * 扫描 mods 目录补装缺失前置（与 ② 并行）。最后统一核对游戏支持库收尾。
+     * <p>解压完成后，两条流水线并行推进：① Mod 下载线解析清单并下载整合包内容；
+     * ② 游戏本体线装原版 JSON / 支持库 / 资源文件与加载器。最后统一核对游戏支持库收尾。
+     *
+     * <p>不再自动补装前置：整合包自带什么 Mod 就装什么，避免把 JEI 的可选伴侣等
+     * 无关 Mod 混进 mods 目录；确实缺前置时可在实例页手动执行「修复前置」。
      */
     public static final List<String> STAGES = List.of(
             "处理整合包",
             "解压整合包文件",
-            "并行下载 Mod / 游戏本体 / 前置检查",
+            "并行下载 Mod / 游戏本体",
             "完成安装");
 
     /** 各阶段在总进度条上的起点，下标 = 阶段号；最后一个元素表示结束。 */
@@ -314,10 +316,9 @@ public class ModpackInstaller {
         }
         unpackStep.update(100, "已解压 " + overrides + " 个配置 / 资源文件");
 
-        // ── 步骤 3：三条流水线并行 ──
+        // ── 步骤 3：两条流水线并行 ──
         // ① Mod 下载线：解析清单 → 并发下载整合包内容
         // ② 游戏本体线：原版 JSON / 支持库 / 资源文件 → 加载器 → 独立版本 JSON
-        // ③ 前置检查线：等 ① 完成后扫描 mods 目录补装缺失前置（与 ② 并行）
         int failed = 0;
         ModDependencyResolver.Result deps = new ModDependencyResolver.Result(0, List.of(), List.of());
         List<NetFile> files = new ArrayList<>();
@@ -328,30 +329,19 @@ public class ModpackInstaller {
 
         AtomicInteger modPct = new AtomicInteger();
         AtomicInteger gamePct = new AtomicInteger();
-        AtomicInteger depPct = new AtomicInteger(-1);
         AtomicReference<String> modMsg = new AtomicReference<>("等待开始");
         AtomicReference<String> gameMsg = new AtomicReference<>("等待开始");
-        AtomicReference<String> depMsg = new AtomicReference<>("");
-        AtomicReference<ModDependencyResolver.Result> depsRef =
-                new AtomicReference<>(new ModDependencyResolver.Result(0, List.of(), List.of()));
         InstallJobService.Progress parStep = band(progress, 3, 1);
         // loader / mcVersion 在裸 zip 识别分支可能被重赋值，lambda 捕获需要终态快照
         final String lineLoader = loader;
         final String lineMc = mcVersion;
         Runnable push = () -> {
-            // 前置未开始时 Mod 下载占整段权重；开始后 Mod 下载与前置各占一半
-            double modPart = depPct.get() < 0 ? modPct.get() : 50 + depPct.get() / 2.0;
-            int combined = (int) (0.35 * modPart + 0.57 * gamePct.get()
-                    + (depPct.get() < 0 ? 0 : 0.08 * depPct.get()));
-            StringBuilder message = new StringBuilder("Mod ").append(modMsg.get())
-                    .append(" ｜ 游戏 ").append(gameMsg.get());
-            if (depPct.get() >= 0) {
-                message.append(" ｜ 前置 ").append(depMsg.get());
-            }
-            parStep.update(Math.max(0, Math.min(100, combined)), message.toString());
+            int combined = (int) (0.35 * modPct.get() + 0.57 * gamePct.get());
+            String message = "Mod " + modMsg.get() + " ｜ 游戏 " + gameMsg.get();
+            parStep.update(Math.max(0, Math.min(100, combined)), message);
         };
 
-        ExecutorService lines = Executors.newFixedThreadPool(3, runnable -> {
+        ExecutorService lines = Executors.newFixedThreadPool(2, runnable -> {
             Thread thread = new Thread(runnable, "pcl-packline");
             thread.setDaemon(true);
             return thread;
@@ -421,41 +411,14 @@ public class ModpackInstaller {
                 });
             }
 
-            // 等 Mod 下载线结束后再启动前置检查线（要扫描下载好的 mods 目录）
             if (modsLine != null) {
                 modsLine.get();
-            }
-            Future<?> depLine = null;
-            if (standalone && !lineLoader.isBlank() && !lineMc.isBlank()) {
-                depMsg.set("检查中…");
-                depPct.set(10);
-                push.run();
-                depLine = lines.submit(() -> {
-                    try {
-                        ModDependencyResolver.Result result =
-                                dependencyResolver.complete(instanceDir.resolve("mods"),
-                                        lineLoader, lineMc);
-                        depsRef.set(result);
-                        depMsg.set(result.installed() > 0
-                                ? "补装 " + result.installed() + " 个前置"
-                                : "已齐全");
-                    } catch (Throwable t) {
-                        depMsg.set("检查失败：" + t.getMessage());
-                        log.warn("前置检查线失败：{}", t.getMessage());
-                    }
-                    depPct.set(100);
-                    push.run();
-                });
             }
             if (gameLine != null) {
                 gameLine.get();
             }
-            if (depLine != null) {
-                depLine.get();
-            }
 
             failed = failedCount.get();
-            deps = depsRef.get();
             loaderVersion = loaderVersionOut.get();
             if (gameError.get() != null) {
                 Throwable t = gameError.get();

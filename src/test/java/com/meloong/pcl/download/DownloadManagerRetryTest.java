@@ -22,7 +22,8 @@ class DownloadManagerRetryTest {
     @Test
     void 下载失败最多重试两次() throws Exception {
         PclProperties properties = new PclProperties();
-        DownloadManager manager = new DownloadManager(properties, new DownloadSources(properties));
+        DownloadManager manager = new DownloadManager(properties, new DownloadSources(properties),
+                new LocalModLibrary(properties));
         Path dir = Files.createTempDirectory("pcl-retry-test");
         NetFile file = NetFile.of("file:///D:/definitely-not-exists/pcl-retry-test.jar",
                 dir.resolve("never-download.jar"), null, 0, "测试文件", SourceKind.LIBRARY);

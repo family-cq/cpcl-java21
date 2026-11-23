@@ -43,6 +43,12 @@ public class PclProperties {
     /** GC 策略，对应 LaunchAdvanceGC：0 自动、1 保守、2 仅 G1GC、3 不指定、4 优化 G1GC。 */
     private int gcMode = 0;
 
+    /**
+     * 额外的本地 Mod 目录：下载前先在这些目录里找同名同内容的 jar，
+     * 命中就复制而不联网（.minecraft/mods 与 versions&#42;/mods 已自动包含）。
+     */
+    private List<String> localModDirs = new ArrayList<>();
+
     /** 是否追加 Log4j 漏洞防御参数。 */
     private boolean log4jPatch = true;
 
@@ -153,6 +159,14 @@ public class PclProperties {
 
     public void setDownloadSource(String downloadSource) {
         this.downloadSource = downloadSource;
+    }
+
+    public List<String> getLocalModDirs() {
+        return localModDirs;
+    }
+
+    public void setLocalModDirs(List<String> localModDirs) {
+        this.localModDirs = localModDirs == null ? new ArrayList<>() : localModDirs;
     }
 
     public int getDefaultMemoryMb() {

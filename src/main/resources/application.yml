@@ -32,6 +32,10 @@ pcl:
   download-thread: 16
   # auto / mirror / official
   download-source: auto
+  # 额外的本地 Mod 库目录：下载前先在这些目录（含其下的 mods / versions/*/mods）里找同名同内容的 jar，
+  # 命中就直接复制、不联网。适合把别的整合包、PCL 下载缓存的 jar 复用过来。
+  # 例：local-mod-dirs: ["D:/minecraft-packs"]
+  local-mod-dirs: []
   # 0 表示按 PCL 的自动内存算法计算
   default-memory-mb: 0
   # 0 自动 / 1 保守 / 2 仅 G1GC / 3 不指定 / 4 优化 G1GC

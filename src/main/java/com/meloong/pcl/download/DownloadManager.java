@@ -54,16 +54,27 @@ public class DownloadManager {
     private static final String NULL_DEVICE =
             System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win") ? "NUL" : "/dev/null";
 
-    /** 小于 512KB 不分片：握手开销占比太高，反而更慢。 */
-    private static final long SEGMENT_MIN_BYTES = 512L * 1024;
-    /** 每片目标大小：1MB 以上就能开满 4 片。 */
-    private static final long SEGMENT_UNIT_BYTES = 256L * 1024;
-    private static final int SEGMENTS_MAX = 4;
-    /** 分片共享的连接上限：16 个文件 × 4 片会把链路打满，统一限流。 */
+    /**
+     * 小于 1MB 不分片：握手开销占比太高，反而更慢。
+     */
+    private static final long SEGMENT_MIN_BYTES = 1024L * 1024;
+    /**
+     * 每片目标大小 512KB。
+     *
+     * <p>实测本机到 cdn.modrinth.com：单连接 35 KB/s、4 连接 69 KB/s、
+     * 8 连接 196 KB/s、16 连接 431 KB/s——单连接被 CDN 限速，连接数越多越快，
+     * 所以分片要开到 16。
+     */
+    private static final long SEGMENT_UNIT_BYTES = 512L * 1024;
+    private static final int SEGMENTS_MAX = 12;
+    /** 单个分片失败后的重试次数（首次 + 2 次续传重试）。 */
+    private static final int SEGMENT_RETRIES = 2;
+    /** 分片共享的连接上限：16 个文件 × 12 片会把链路打满，统一限流。 */
     private static final int MAX_CONNECTIONS = 48;
 
     private final PclProperties properties;
     private final DownloadSources sources;
+    private final LocalModLibrary localMods;
     private final HttpClient httpClient;
     private final ExecutorService executor;
     /** 分片下载专用的线程池，和文件级线程池分开，避免互相等待造成死锁。 */
@@ -73,13 +84,17 @@ public class DownloadManager {
     /** CDN 静态资源几乎不变，同一次安装里同一地址只探测一次。 */
     private final java.util.Map<String, Probe> probeCache = new ConcurrentHashMap<>();
 
+    /** 本次运行里靠本地复用省掉的下载数。 */
+    private final AtomicInteger reused = new AtomicInteger();
+
     /** 正在下载中的临时文件，采样线程按文件体积增量估算实时网速。 */
     private final Set<Path> activeTemps = ConcurrentHashMap.newKeySet();
     private volatile long speedBps = 0;
 
-    public DownloadManager(PclProperties properties, DownloadSources sources) {
+    public DownloadManager(PclProperties properties, DownloadSources sources, LocalModLibrary localMods) {
         this.properties = properties;
         this.sources = sources;
+        this.localMods = localMods;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(15))
                 .followRedirects(HttpClient.Redirect.NORMAL)
@@ -232,7 +247,8 @@ public class DownloadManager {
                 errors.add(ex.getMessage());
             }
         }
-        log.info("下载完成：成功 {}，跳过 {}，失败 {}，共 {} 字节", downloaded.get(), skipped, failed.get(), bytes.get());
+        log.info("下载完成：成功 {}（其中本机复用 {}），跳过 {}，失败 {}，共 {} 字节",
+                downloaded.get(), reused.get(), skipped, failed.get(), bytes.get());
         return new DownloadSummary(files.size(), downloaded.get(), skipped, failed.get(), bytes.get(), List.copyOf(errors));
     }
 
@@ -240,6 +256,9 @@ public class DownloadManager {
     public long download(NetFile file) throws IOException, InterruptedException {
         if (isUpToDate(file)) {
             return 0;
+        }
+        if (reuseLocal(file)) {
+            return Files.size(file.localPath());
         }
         List<String> urls = sources.resolve(file.kind(), file.url());
         if (urls.isEmpty()) {
@@ -295,6 +314,37 @@ public class DownloadManager {
         long size = Files.size(temp);
         Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
         return size;
+    }
+
+    /**
+     * 本机已有同一份文件时直接复制，不联网。
+     *
+     * <p>整合包之间大量复用同一个 Mod 版本，而国内到 CDN 的单连接只有几十 KB/s，
+     * 一次本地复制的收益远大于任何并发技巧。
+     */
+    private boolean reuseLocal(NetFile file) {
+        Path target = file.localPath();
+        if (localMods == null || target == null) {
+            return false;
+        }
+        String name = target.getFileName().toString().toLowerCase(Locale.ROOT);
+        if (!name.endsWith(".jar") && !name.endsWith(".zip")) {
+            return false;
+        }
+        var hit = localMods.find(file);
+        if (hit.isEmpty() || hit.get().equals(target)) {
+            return false;
+        }
+        try {
+            Files.createDirectories(target.getParent());
+            Files.copy(hit.get(), target, StandardCopyOption.REPLACE_EXISTING);
+            log.info("命中本机已有文件，跳过下载：{} <- {}", file.description(), hit.get());
+            reused.incrementAndGet();
+            return true;
+        } catch (IOException ex) {
+            log.debug("复制本地文件失败，改走下载（{}）：{}", hit.get(), ex.getMessage());
+            return false;
+        }
     }
 
     /** 探测结果：跳转后的真实地址、文件总大小、是否支持 Range。 */
@@ -372,35 +422,116 @@ public class DownloadManager {
         }
     }
 
-    /** 下载一个字节区间到独立分片文件，大小对不上即判失败。 */
+    /** 下载一个字节区间到独立分片文件；慢速/中断会按已收字节续传，最多再试 2 次。 */
     private void downloadRange(String url, Path part, long start, long end) throws IOException, InterruptedException {
+        long expected = end - start + 1;
         connections.acquire();
         try {
             Files.deleteIfExists(part);
-            ProcessBuilder builder = new ProcessBuilder(
-                    CURL.toString(),
-                    "--fail", "--silent", "--show-error",
-                    "--connect-timeout", "15",
-                    "--speed-time", "30", "--speed-limit", "4096",
-                    "--max-time", "600",
-                    "--range", start + "-" + end,
-                    "--output", part.toString(),
-                    "--user-agent", userAgent(),
-                    safeUri(url).toString());
-            builder.redirectErrorStream(true);
-            Process process = builder.start();
-            String output;
-            try (InputStream in = process.getInputStream()) {
-                output = new String(in.readAllBytes(), StandardCharsets.UTF_8).trim();
+            IOException last = null;
+            for (int attempt = 1; attempt <= SEGMENT_RETRIES + 1; attempt++) {
+                long have = Files.isRegularFile(part) ? Files.size(part) : 0L;
+                if (have >= expected) {
+                    break;
+                }
+                long from = start + have;
+                long remain = end - from + 1;
+                Path chunk = part.resolveSibling(part.getFileName() + ".r" + attempt);
+                try {
+                    int[] result = curlRange(url, chunk, from, end);
+                    int exit = result[0];
+                    int http = result[1];
+                    long got = Files.isRegularFile(chunk) ? Files.size(chunk) : 0L;
+                    if (http == 206 && got > 0) {
+                        // 服务端确认按区间返回：已收字节位于 [from, from+got)，
+                        // 即使慢速被 curl 掐断（退出码 28）也仍然有效，追加后从断点续传
+                        append(part, chunk);
+                        Files.deleteIfExists(chunk);
+                        have += got;
+                        if (have >= expected) {
+                            break;
+                        }
+                        last = new IOException("分片 " + start + "-" + end + " 未下完（退出码 " + exit
+                                + "，已收 " + have + "/" + expected + " 字节）");
+                    } else if (exit == 0 && got == remain && from == start) {
+                        // 服务端忽略 Range 直接回了整文件（200），仅在区间等于全文件时接受
+                        Files.move(chunk, part, StandardCopyOption.REPLACE_EXISTING);
+                        break;
+                    } else {
+                        Files.deleteIfExists(chunk);
+                        last = new IOException("分片 " + start + "-" + end + " 失败（退出码 " + exit
+                                + "，HTTP " + http + "，已收 " + got + "/" + remain + " 字节）");
+                    }
+                } catch (InterruptedException ex) {
+                    Files.deleteIfExists(chunk);
+                    throw ex;
+                } catch (IOException ex) {
+                    Files.deleteIfExists(chunk);
+                    last = ex;
+                }
+                if (attempt <= SEGMENT_RETRIES) {
+                    Thread.sleep(400L * attempt);
+                }
             }
-            int code = process.waitFor();
-            long expected = end - start + 1;
-            if (code != 0 || !Files.isRegularFile(part) || Files.size(part) != expected) {
-                throw new IOException("分片 " + start + "-" + end + " 失败（curl 退出码 " + code + "）"
-                        + (output.isBlank() ? "" : "：" + output));
+            long size = Files.isRegularFile(part) ? Files.size(part) : 0L;
+            if (size != expected) {
+                throw last != null ? last
+                        : new IOException("分片 " + start + "-" + end + " 不完整（" + size + "/" + expected + " 字节）");
             }
         } finally {
             connections.release();
+        }
+    }
+
+    /**
+     * 请求一个字节区间，返回 {curl 退出码, HTTP 状态码}。
+     *
+     * <p>停滞保护放宽到「60 秒内低于 512 B/s」：CDN 国内单连接本就只有 30~40 KB/s，
+     * 原来的 4 KB/s × 30 秒会把正常但慢的连接误杀（实测退出码 28）。
+     */
+    private int[] curlRange(String url, Path chunk, long from, long end) throws IOException, InterruptedException {
+        Files.deleteIfExists(chunk);
+        ProcessBuilder builder = new ProcessBuilder(
+                CURL.toString(),
+                "--fail", "--silent", "--show-error",
+                "--connect-timeout", "15",
+                "--speed-time", "60", "--speed-limit", "512",
+                "--max-time", "900",
+                "--range", from + "-" + end,
+                "--output", chunk.toString(),
+                "--write-out", "%{http_code}",
+                "--user-agent", userAgent(),
+                safeUri(url).toString());
+        builder.redirectErrorStream(true);
+        Process process = builder.start();
+        String output;
+        try (InputStream in = process.getInputStream()) {
+            output = new String(in.readAllBytes(), StandardCharsets.UTF_8).trim();
+        }
+        int code = process.waitFor();
+        int http = lastNumber(output);
+        return new int[]{code, http};
+    }
+
+    /** 取输出末尾的 HTTP 状态码（curl --write-out 追加在最后一行）。 */
+    static int lastNumber(String output) {
+        if (output == null || output.isBlank()) {
+            return 0;
+        }
+        String[] lines = output.split("\\R");
+        for (int i = lines.length - 1; i >= 0; i--) {
+            String line = lines[i].trim();
+            if (line.matches("\\d{3}")) {
+                return Integer.parseInt(line);
+            }
+        }
+        return 0;
+    }
+
+    private void append(Path target, Path chunk) throws IOException {
+        try (var out = Files.newOutputStream(target,
+                java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND)) {
+            Files.copy(chunk, out);
         }
     }
 
@@ -525,7 +656,7 @@ public class DownloadManager {
                 "--fail", "--silent", "--show-error", "--location",
                 "--connect-timeout", "15",
                 "--speed-time", "60", "--speed-limit", "1024",
-                "--max-time", "600",
+                "--max-time", "1800",
                 "--output", temp.toString(),
                 "--user-agent", properties.getLauncherName() + "/" + properties.getLauncherVersion(),
                 safeUri(url).toString());

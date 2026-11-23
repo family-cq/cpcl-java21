@@ -41,7 +41,7 @@ import java.util.zip.ZipFile;
  * 整合包前置 Mod 自动补齐（PCL 原版依赖思路的 Java 移植，无内置补丁表、可移植）。
  *
  * <p>很多整合包（尤其是作者手工整理的裸 zip）不会把前置 Mod 一起打进来，启动时 FML 直接报
- * 「Missing or unsupported mandatory dependencies」并崩溃。这里按三条<b>通用</b>渠道发现缺失，
+ * 「Missing or unsupported mandatory dependencies」并崩溃。这里按两条<b>通用</b>渠道发现缺失，
  * 换任何一台机器、任何一个整合包都能跑，不依赖任何手工维护的补丁表：
  *
  * <ol>
@@ -54,14 +54,13 @@ import java.util.zip.ZipFile;
  *       Fabric {@code fabric.mod.json} 里 mandatory 的依赖；对已装版本还做 Maven 区间
  *       满足性检查（如 Cataclysm 声明 {@code lionfishapi [3.0,)}，老包里的 2.4-Fix 不满足
  *       就升级替换），区间外旧 jar 备份到 {@code .pcl-removed}。</li>
- *   <li><b>类引用扫描</b>：mixin / 扩展 Mod 经常<b>不声明</b>依赖（cataclysm_modifier 直接
- *       引用 ExModifier 的 ExUtil 却没有任何 [[dependencies]]），扫 jar 内 class 常量池
- *       引用的外部包，减去 JDK/MC/加载器等环境包与已装 Mod 提供的包，剩下的缺口包转成
- *       搜索词去 Modrinth / CurseForge 找，下载后校验 jar 确实包含该包才落盘。</li>
  * </ol>
  *
- * <p>匹配策略偏保守：按 modId 补的候选要求 slug/标题归一化后一致且 jar 内 modId 对得上；
- * 按缺口包补的候选要求 jar 内真实存在该包。宁可漏装也不装错，因为装错 Mod 会带来更难排查的崩溃。
+ * <p>匹配策略偏保守：按 modId 补的候选要求 slug/标题归一化后一致且 jar 内 modId 对得上。
+ * 宁可漏装也不装错，因为装错 Mod 会带来更难排查的崩溃。
+ *
+ * <p>早期的「类引用扫描」（扫 class 常量池找缺口包再拿去搜索）已移除：JEI 这类 Mod 的
+ * 可选伴侣（如 mezz_config_gui）会被它当成缺口装进 mods 目录，导致导入后 Mod 与原包对不上。
  */
 @Service
 public class ModDependencyResolver {
@@ -90,28 +89,6 @@ public class ModDependencyResolver {
     private static final Set<String> PLATFORM_NOISE_PIDS = Set.of("P7dR8mSH", "qvIfYCYJ");
 
     /**
-     * 环境包前缀：JDK、Minecraft、加载器与其自带三方库提供的包。
-     * 类引用扫描时这些不算缺口（它们由游戏/加载器环境提供，不需要装 Mod）。
-     * 只放环境库；像 architectury、cloth-config 这类<b>真 Mod</b> 的包绝不能进来，
-     * 否则该补的前置会被漏掉。
-     */
-    private static final List<String> ENV_PREFIXES = List.of(
-            "java/", "javax/", "sun/", "com/sun/", "jdk/", "org/w3c/", "org/xml/", "org/ietf/",
-            "com/mojang/", "net/minecraft/", "net/minecraftforge/", "net/neoforged/",
-            "net/fabricmc/", "net/fabricloader/", "org/quiltmc/", "cpw/mods/", "io/undertow/",
-            "org/spongepowered/", "org/objectweb/", "org/apache/", "com/google/", "com/fasterxml/",
-            "io/netty/", "it/unimi/", "org/joml/", "org/lwjgl/", "org/slf4j/", "org/jetbrains/",
-            "org/intellij/", "org/jline/", "org/ow2/", "org/yaml/", "org/tukaani/", "org/glm/",
-            "oshi/", "com/machinezoo/", "net/jodah/", "com/ibm/", "com/zaxxer/", "gnu/trove/",
-            "kotlin/", "kotlinx/", "com/electronwill/", "net/minecrell/", "joptsimple/",
-            "com/mumfrey/", "com/llamalad7/", "org/joml/");
-
-    /** 搜索词里跳过的无意义包名段（生成缺口包搜索词时用）。 */
-    private static final Set<String> NOISE_SEGMENTS = Set.of(
-            "com", "net", "org", "io", "dev", "github", "mods", "mod", "mc", "minecraft",
-            "forge", "fabric", "neoforge", "content", "common", "core", "util", "utils");
-
-    /**
      * 用于给 modId 猜想 slug 分词的常见词尾。
      *
      * <p>只用于「猜 slug」这一步，命中后仍要求归一化完全相等，所以词表不全会漏装，
@@ -128,20 +105,8 @@ public class ModDependencyResolver {
 
     /** 单轮最多补装数量，防止包内依赖链异常时无限扩散。 */
     private static final int MAX_PER_ROUND = 60;
-    /**
-     * 单轮最多处理的类引用缺口数。
-     *
-     * <p>类引用扫描的缺口里混着大量「生态 API」（JEI/REI/EMI 等编译期集成），
-     * 它们不装通常也能启动；真正的扩展前置（exmodifier、ftbquests）引用者很少、优先级高。
-     * 每轮只补最像必需前置的几个，其余留到下一轮或列入未解决清单。
-     */
-    private static final int MAX_GAP_PER_ROUND = 10;
-    /** 缺口候选的体积上限：只拦异常超大（100MB+）的包，本体 70MB 的 Cataclysm 必须能过。 */
-    private static final long MAX_GAP_CANDIDATE_BYTES = 100L * 1024 * 1024;
-    /** 缺口包最多生成 2 个搜索词，第三个多是包名末段噪音。 */
-    private static final int MAX_GAP_QUERIES = 2;
-    /** 单个缺口最多尝试 2 个候选（含重试），都不匹配就跳过，换下一个缺口。 */
-    private static final int MAX_GAP_CANDIDATES = 2;
+    /** 单个前置最多尝试 2 个候选（含重试），都不匹配就跳过。 */
+    private static final int MAX_CANDIDATES = 2;
     private static final int MAX_ROUNDS = 4;
     /** 并行补装的线程数：每个 Mod 的候选查询与下载相互独立，串行时 16 个前置要跑五六分钟。 */
     private static final int PARALLELISM = 8;
@@ -154,14 +119,6 @@ public class ModDependencyResolver {
     private static final Pattern RAW_VALUE = Pattern.compile("%s\\s*=\\s*([^\\r\\n]*)");
     /** 布尔写法里视为「否」的那些。 */
     private static final Set<String> FALSE_WORDS = Set.of("false", "0", "no", "off");
-    /**
-     * class 常量池里的类引用：形如 {@code Lnet/exmo/exmodifier/util/ExUtil;}。
-     * 直接对 class 字节流做正则，无需完整解析字节码，速度足够且误报极少
-     * （字符串常量里出现 {@code Lx/y/z;} 的概率可以忽略）。
-     */
-    private static final Pattern CLASS_REF =
-            Pattern.compile("L([a-z][a-zA-Z0-9_]*(?:/[a-zA-Z0-9_$]+)+);");
-
     private final RestTemplate restTemplate;
     private final ObjectMapper mapper;
     private final PclProperties properties;
@@ -198,13 +155,12 @@ public class ModDependencyResolver {
     /**
      * 一条待补齐依赖。
      *
-     * @param key               日志标识：modId、平台 project_id 或 {@code pkg:xxx}
-     * @param platformProjectId 非 null 时走平台直取（Modrinth project_id）
-     * @param gapPackage        非 null 时是「类引用缺口包」，下载后必须校验 jar 含该包
+ * @param key               日志标识：modId 或 {@code pid:xxx}
+ * @param platformProjectId 非 null 时走平台直取（Modrinth project_id）
      * @param upgrade           true 表示已装但版本不满足声明区间，装前要把旧 jar 移走
      * @param requiredBy        谁需要它（日志/前端展示用）
      */
-    private record Missing(String key, String platformProjectId, String gapPackage,
+    private record Missing(String key, String platformProjectId,
                            boolean upgrade, String requiredBy) {
     }
 
@@ -315,13 +271,13 @@ public class ModDependencyResolver {
                 String have = scan.installed().get(dep.modId());
                 if (have == null) {
                     if (seen.add(dep.modId())) {
-                        missing.add(new Missing(dep.modId(), null, null, false,
+                        missing.add(new Missing(dep.modId(), null, false,
                                 entry.getKey() + " 声明依赖"));
                     }
                 } else if (upgradeNeeded(have, dep.versionRange())) {
                     // 已装但版本明确不满足（如 lionfishapi 2.4-Fix < [3.0,)），需要升级替换
                     if (seen.add(dep.modId())) {
-                        missing.add(new Missing(dep.modId(), null, null, true,
+                        missing.add(new Missing(dep.modId(), null, true,
                                 entry.getKey() + " 要求 " + dep.versionRange() + "（现有 " + have + "）"));
                     }
                 }
@@ -337,49 +293,12 @@ public class ModDependencyResolver {
                     continue;
                 }
                 if (seen.add("pid:" + pid)) {
-                    missing.add(new Missing("pid:" + pid, pid, null, false,
+                    missing.add(new Missing("pid:" + pid, pid, false,
                             ownerName + " 平台声明依赖"));
                 }
             }
         }
 
-        // 3) 类引用缺口：不声明依赖的扩展 Mod 引用了未安装的外部包
-        //    同一库往往有多个 4 段缺口包（exmodifier/util、exmodifier/content），
-        //    按前 3 段去重；单轮只补引用者最少的几个（越少越像特定扩展的必需前置）。
-        //    注意不能按引用者数量「一刀切」过滤生态 API：像 exmodifier 被
-        //    cataclysm_modifier/elementex/rough_blade 整个 mod 族引用，但它就是必需前置。
-        Map<String, Set<String>> groupOwners = new LinkedHashMap<>();
-        Map<String, String> groupPkg = new LinkedHashMap<>();
-        for (Map.Entry<String, Set<String>> entry : scan.references().entrySet()) {
-            for (String ref : entry.getValue()) {
-                if (isEnvClass(ref) || ownedByInstalled(ref, scan.providedDirs())) {
-                    continue;
-                }
-                String pkg = gapPkgOf(ref);
-                if (pkg == null || coveredBy(pkg, scan.providedDirs())) {
-                    continue;
-                }
-                String group = groupOf(pkg);
-                groupOwners.computeIfAbsent(group, k -> new LinkedHashSet<>()).add(entry.getKey());
-                groupPkg.putIfAbsent(group, pkg);
-            }
-        }
-        List<Map.Entry<String, Set<String>>> groups = new ArrayList<>(groupOwners.entrySet());
-        groups.sort(java.util.Comparator.comparingInt(e -> e.getValue().size()));
-        int gapBudget = MAX_GAP_PER_ROUND;
-        for (Map.Entry<String, Set<String>> group : groups) {
-            if (gapBudget <= 0) {
-                break;
-            }
-            Set<String> owners = group.getValue();
-            String pkg = groupPkg.get(group.getKey());
-            if (!seen.add("pkg:" + pkg)) {
-                continue;
-            }
-            missing.add(new Missing("pkg:" + pkg, null, pkg, false,
-                    String.join("、", owners) + " 引用了包 " + pkg.replace('/', '.')));
-            gapBudget--;
-        }
         return missing;
     }
 
@@ -420,18 +339,15 @@ public class ModDependencyResolver {
      * @param paths           modId -> jar 路径
      * @param platformIds     modId -> Modrinth project_id（sha1 反查命中才有）
      * @param platformNames   project_id -> 项目名
-     * @param platformRequired project_id -> 该版本声明的 required 依赖 project_id 列表
-     * @param providedDirs    所有已装 jar 提供的 class 目录路径全集
-     * @param references      modId -> 引用的外部类路径（未经环境过滤）
-     */
+ * @param platformRequired project_id -> 该版本声明的 required 依赖 project_id 列表
+ */
     private record Scan(Map<String, String> installed, Map<String, List<Dep>> deps,
                         Map<String, Path> paths, Map<String, String> platformIds,
-                        Map<String, String> platformNames, Map<String, List<String>> platformRequired,
-                        Set<String> providedDirs, Map<String, Set<String>> references) {
+                        Map<String, String> platformNames,
+                        Map<String, List<String>> platformRequired) {
     }
 
-    private record JarScan(Path jar, String modId, String version, List<Dep> deps, String sha1,
-                           Set<String> dirs, Set<String> refs) {
+    private record JarScan(Path jar, String modId, String version, List<Dep> deps, String sha1) {
     }
 
     /** 扫描 mods 目录：并行读元数据/hash/包结构，然后批量反查 Modrinth。 */
@@ -441,7 +357,7 @@ public class ModDependencyResolver {
             jars = stream.filter(p -> p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar"))
                     .toList();
         }
-        // 并行读每个 jar 的元数据、sha1、class 目录与类引用
+        // 并行读每个 jar 的元数据与 sha1
         List<JarScan> scans = new ArrayList<>();
         ExecutorService pool = Executors.newFixedThreadPool(PARALLELISM);
         try {
@@ -466,8 +382,6 @@ public class ModDependencyResolver {
         Map<String, String> installed = new LinkedHashMap<>();
         Map<String, List<Dep>> deps = new LinkedHashMap<>();
         Map<String, Path> paths = new LinkedHashMap<>();
-        Set<String> providedDirs = new LinkedHashSet<>();
-        Map<String, Set<String>> references = new LinkedHashMap<>();
         Map<String, String> sha1ByModId = new LinkedHashMap<>();
         for (JarScan item : scans) {
             if (item.modId().isBlank()) {
@@ -477,10 +391,6 @@ public class ModDependencyResolver {
             paths.putIfAbsent(item.modId(), item.jar());
             if (!item.deps().isEmpty()) {
                 deps.put(item.modId(), item.deps());
-            }
-            providedDirs.addAll(item.dirs());
-            if (!item.refs().isEmpty()) {
-                references.put(item.modId(), item.refs());
             }
             sha1ByModId.put(item.modId(), item.sha1());
         }
@@ -516,30 +426,17 @@ public class ModDependencyResolver {
                 }
             }
         } catch (Exception ex) {
-            // 平台反查只是渠道之一，失败不影响声明解析与类引用扫描
+            // 平台反查只是渠道之一，失败不影响声明解析
             log.info("Modrinth sha1 反查失败（不影响其余渠道）：{}", brief(ex.getMessage()));
         }
-        return new Scan(installed, deps, paths, platformIds, platformNames, platformRequired,
-                providedDirs, references);
+        return new Scan(installed, deps, paths, platformIds, platformNames, platformRequired);
     }
 
-    /** 深读一个 jar：元数据 + sha1 + class 目录 + 类引用。 */
+    /** 深读一个 jar：元数据 + sha1。 */
     private JarScan readJarDeep(Path jar) {
         String sha1 = sha1Of(jar);
-        Set<String> dirs = new LinkedHashSet<>();
-        Set<String> refs = new LinkedHashSet<>();
         JarMeta meta = JarMeta.empty();
         try (ZipFile zip = new ZipFile(jar.toFile())) {
-            for (java.util.Enumeration<? extends ZipEntry> it = zip.entries(); it.hasMoreElements(); ) {
-                ZipEntry entry = it.nextElement();
-                String name = entry.getName();
-                if (name.endsWith(".class")) {
-                    int slash = name.lastIndexOf('/');
-                    if (slash > 0) {
-                        dirs.add(name.substring(0, slash));
-                    }
-                }
-            }
             ZipEntry fabric = zip.getEntry("fabric.mod.json");
             if (fabric != null) {
                 try (InputStream in = zip.getInputStream(fabric)) {
@@ -560,28 +457,10 @@ public class ModDependencyResolver {
                     }
                 }
             }
-            // 类引用扫描：对 class 字节流直接正则，无完整字节码解析
-            for (java.util.Enumeration<? extends ZipEntry> it = zip.entries(); it.hasMoreElements(); ) {
-                ZipEntry entry = it.nextElement();
-                if (!entry.getName().endsWith(".class")) {
-                    continue;
-                }
-                byte[] data;
-                try (InputStream in = zip.getInputStream(entry)) {
-                    data = in.readAllBytes();
-                }
-                if (data.length > 3_000_000) {
-                    continue; // 异常巨大的 class 跳过，避免极端性能问题
-                }
-                Matcher m = CLASS_REF.matcher(new String(data, StandardCharsets.ISO_8859_1));
-                while (m.find()) {
-                    refs.add(m.group(1));
-                }
-            }
         } catch (Exception ex) {
             log.debug("读取 Mod 元数据失败（{}）：{}", jar.getFileName(), ex.getMessage());
         }
-        return new JarScan(jar, meta.modId(), meta.version(), meta.deps(), sha1, dirs, refs);
+        return new JarScan(jar, meta.modId(), meta.version(), meta.deps(), sha1);
     }
 
     private String sha1Of(Path jar) {
@@ -618,66 +497,6 @@ public class ModDependencyResolver {
             }
         }
         return result;
-    }
-
-    // ------------------------------------------------------------------ 类引用归属
-
-    /** 引用类是否属于环境包（JDK / MC / 加载器 / 自带三方库）。 */
-    private static boolean isEnvClass(String ref) {
-        for (String prefix : ENV_PREFIXES) {
-            if (ref.startsWith(prefix)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * 引用类是否由已装 Mod 提供：取它的各级目录前缀，任一命中已装 class 目录即归属。
-     * 例如 {@code net/exmo/exmodifier/util/ExUtil} 会在 exmodifier 已装时命中其目录
-     * {@code net/exmo/exmodifier/util}。
-     */
-    private static boolean ownedByInstalled(String ref, Set<String> providedDirs) {
-        int end = ref.lastIndexOf('/');
-        while (end > 0) {
-            if (providedDirs.contains(ref.substring(0, end))) {
-                return true;
-            }
-            end = ref.lastIndexOf('/', end - 1);
-        }
-        return false;
-    }
-
-    /**
-     * 缺口包：引用类去掉最后一段（类名）后取前 4 段。
-     * {@code dev/ftb/mods/ftbquests/team/Team} -> {@code dev/ftb/mods/ftbquests}。
-     */
-    private static String gapPkgOf(String ref) {
-        String pkg = ref.contains("/")
-                ? ref.substring(0, ref.lastIndexOf('/'))
-                : ref;
-        String[] parts = pkg.split("/");
-        if (parts.length < 2) {
-            return null;
-        }
-        int keep = Math.min(4, parts.length);
-        return String.join("/", java.util.Arrays.copyOfRange(parts, 0, keep));
-    }
-
-    /** 缺口包按前 3 段分组去重用（同一库的不同子包视为一组）。 */
-    private static String groupOf(String pkg) {
-        String[] parts = pkg.split("/");
-        return String.join("/", java.util.Arrays.copyOfRange(parts, 0, Math.min(3, parts.length)));
-    }
-
-    /** 缺口包是否已被已装目录覆盖（目录等于它、是它的前缀或它本身是某目录前缀）。 */
-    private static boolean coveredBy(String pkg, Set<String> providedDirs) {
-        for (String dir : providedDirs) {
-            if (dir.equals(pkg) || dir.startsWith(pkg + "/") || pkg.startsWith(dir + "/")) {
-                return true;
-            }
-        }
-        return false;
     }
 
     // ------------------------------------------------------------------ TOML 解析
@@ -752,8 +571,8 @@ public class ModDependencyResolver {
     /**
      * 按 Missing 的类型选择安装路径，成功写入 mods 目录返回 true。
      *
-     * <p>关键保险：按 modId 补的候选下载完先读 jar 里的 modId，对不上就丢弃换下一个；
-     * 按缺口包补的候选要求 jar 里真实存在该包。装错 Mod 会导致更难排查的崩溃。
+ * <p>关键保险：按 modId 补的候选下载完先读 jar 里的 modId，对不上就丢弃换下一个。
+ * 装错 Mod 会导致更难排查的崩溃。
      */
     private boolean install(Path modsDir, Missing item, String loader, String mcVersion) {
         // 版本不满足的旧 jar 先移走（备份到 .pcl-removed），否则同 modId 两份会冲突
@@ -762,9 +581,6 @@ public class ModDependencyResolver {
         }
         if (item.platformProjectId() != null) {
             return installPlatform(modsDir, item, loader, mcVersion);
-        }
-        if (item.gapPackage() != null) {
-            return installGap(modsDir, item, loader, mcVersion);
         }
         return installById(modsDir, item, loader, mcVersion);
     }
@@ -812,95 +628,7 @@ public class ModDependencyResolver {
         if (candidate == null) {
             return false;
         }
-        return downloadCandidate(modsDir, candidate, item.key(), null);
-    }
-
-    /** 类引用缺口：把缺口包转成搜索词找候选，下载后校验 jar 确实包含该包。 */
-    private boolean installGap(Path modsDir, Missing item, String loader, String mcVersion) {
-        String facetLoader = "neoforge".equals(loader) ? "neoforge" : loader;
-        int tried = 0;
-        for (Candidate candidate : gapCandidates(item.gapPackage(), facetLoader, mcVersion)) {
-            // 缺口搜索命中的候选很多是 Create/Thermal 这类大 Mod（错误候选），
-            // 而真正的扩展前置一般不超过十几 MB，超大先跳过，避免一轮补齐被拖上半小时
-            if (candidate.size() > MAX_GAP_CANDIDATE_BYTES) {
-                log.info("缺口 {} 候选 {} 体积 {}MB 过大，跳过", item.gapPackage(),
-                        candidate.fileName(), candidate.size() / 1024 / 1024);
-                continue;
-            }
-            if (downloadCandidate(modsDir, candidate, item.key(), item.gapPackage())) {
-                return true;
-            }
-            if (++tried >= MAX_GAP_CANDIDATES) {
-                log.info("缺口 {} 已尝试 {} 个候选都不匹配，跳过换下一个", item.gapPackage(), tried);
-                break;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * 缺口包的候选来源：包名尾部有效段转成 slug / 搜索词。
-     * {@code dev/ftb/mods/ftbquests} -> ftb-quests / FTB Quests；
-     * {@code net/exmo/exmodifier} -> exmodifier。
-     */
-    private List<Candidate> gapCandidates(String gapPackage, String loader, String mcVersion) {
-        // 从包名尾部往前收集有效段（跳过 com/net/dev 等噪音段）
-        List<String> segs = new ArrayList<>();
-        String[] parts = gapPackage.split("/");
-        for (int i = parts.length - 1; i >= 0 && segs.size() < 2; i--) {
-            String seg = parts[i].toLowerCase(Locale.ROOT);
-            if (!NOISE_SEGMENTS.contains(seg)) {
-                segs.add(0, seg);
-            }
-        }
-        if (segs.isEmpty()) {
-            segs.add(parts[parts.length - 1].toLowerCase(Locale.ROOT));
-        }
-        LinkedHashSet<String> queries = new LinkedHashSet<>();
-        queries.add(String.join("-", segs));
-        queries.add(String.join(" ", segs));
-        if (segs.size() > 1) {
-            queries.add(segs.get(segs.size() - 1));
-        }
-        // 最多只搜 2 个搜索词：第三个往往只剩包名末段（apotheosis/ench -> ench），
-        // 搜出来基本是无关 Mod，只会把补齐拖慢
-        List<String> queryList = new ArrayList<>(new ArrayList<>(queries).subList(0, Math.min(MAX_GAP_QUERIES, queries.size())));
-        log.info("缺口包 {} 转搜索词：{}", gapPackage, queryList);
-
-        List<Candidate> result = new ArrayList<>();
-        // 先按 slug 直查（dev/ftb/mods/ftbquests -> ftb-quests 这种正好就是 slug）
-        for (String slugQuery : new LinkedHashSet<>(queryList)) {
-            String slug = slugQuery.replace(' ', '-');
-            Candidate candidate = bySlug(slug, loader, mcVersion);
-            if (candidate != null) {
-                result.add(candidate);
-                if (result.size() >= 3) {
-                    return result;
-                }
-            }
-        }
-        for (String slug : searchSlugs(queryList, loader, mcVersion)) {
-            Candidate candidate = bySlug(slug, loader, mcVersion);
-            if (candidate != null) {
-                result.add(candidate);
-                if (result.size() >= 3) {
-                    return result;
-                }
-            }
-        }
-        // CurseForge 兜底（cfwidget 免 Key）
-        for (String slugQuery : queryList) {
-            try {
-                Candidate curse = fromCfwidget(slugQuery.replace(' ', '-'), loader, mcVersion);
-                if (curse != null) {
-                    result.add(curse);
-                    break;
-                }
-            } catch (Exception ex) {
-                log.info("cfwidget 查询 {} 失败：{}", slugQuery, brief(ex.getMessage()));
-            }
-        }
-        return result;
+        return downloadCandidate(modsDir, candidate, item.key());
     }
 
     /**
@@ -916,8 +644,8 @@ public class ModDependencyResolver {
         int tried = 0;
         for (Candidate candidate : candidates(modId, loader, mcVersion)) {
             // 候选下载 + 校验最多 2 次，不匹配就跳过，避免一个前置把整轮补齐拖死
-            if (++tried > MAX_GAP_CANDIDATES) {
-                log.info("前置 Mod {} 已尝试 {} 个候选都不匹配，跳过", modId, MAX_GAP_CANDIDATES);
+            if (++tried > MAX_CANDIDATES) {
+                log.info("前置 Mod {} 已尝试 {} 个候选都不匹配，跳过", modId, MAX_CANDIDATES);
                 break;
             }
             try {
@@ -953,8 +681,8 @@ public class ModDependencyResolver {
         return false;
     }
 
-    /** 统一下载入口；expectPackage 非 null 时要求 jar 里确实存在该包。 */
-    private boolean downloadCandidate(Path modsDir, Candidate candidate, String key, String expectPackage) {
+    /** 统一下载入口。 */
+    private boolean downloadCandidate(Path modsDir, Candidate candidate, String key) {
         Path tmp = modsDir.resolve(".pcl-dep-" + key.replaceAll("[^A-Za-z0-9_-]", "_") + ".jar");
         try {
             Files.deleteIfExists(tmp);
@@ -963,13 +691,6 @@ public class ModDependencyResolver {
                             "前置 Mod " + key, SourceKind.LIBRARY)));
             if (summary.failed() > 0) {
                 log.warn("前置 {} 候选 {} 下载失败：{}", key, candidate.fileName(), summary.errors());
-                Files.deleteIfExists(tmp);
-                return false;
-            }
-            // 先校验缺口包再查重：搜索命中的候选可能是别的 Mod（如搜 config 命中
-            // cloth-config），它确实已在 mods 目录但解决不了当前缺口，不能当成功
-            if (expectPackage != null && !jarContainsPackage(tmp, expectPackage)) {
-                log.info("候选 {} 里没有包 {}，丢弃换下一个", candidate.fileName(), expectPackage);
                 Files.deleteIfExists(tmp);
                 return false;
             }
@@ -1031,21 +752,6 @@ public class ModDependencyResolver {
         } catch (Exception ex) {
             return "";
         }
-    }
-
-    /** jar 里是否存在指定包目录（含其子包）。 */
-    private static boolean jarContainsPackage(Path jar, String pkg) {
-        try (ZipFile zip = new ZipFile(jar.toFile())) {
-            String prefix = pkg.endsWith("/") ? pkg : pkg + "/";
-            for (java.util.Enumeration<? extends ZipEntry> it = zip.entries(); it.hasMoreElements(); ) {
-                if (it.nextElement().getName().startsWith(prefix)) {
-                    return true;
-                }
-            }
-        } catch (Exception ignored) {
-            // 读不了当作没有
-        }
-        return false;
     }
 
     /**
@@ -1165,7 +871,7 @@ public class ModDependencyResolver {
      * {@code l_enders-cataclysm}；用子序列匹配（查询词每个字符按序出现在
      * slug/标题里即可）能放行 {@code lendercataclysm → lenderscataclysm}、
      * 同时排除 {@code lendercataclysm → goetycataclysm}。误放行的还有下载后的
-     * jar modId / 缺口包校验兜底，不会装错。
+     * jar modId 校验兜底，不会装错。
      */
     private List<String> searchSlugs(List<String> queries, String loader, String mcVersion) {
         LinkedHashSet<String> slugs = new LinkedHashSet<>();
@@ -1392,7 +1098,7 @@ public class ModDependencyResolver {
      * 配合 {@code mediafilez.forgecdn.net} 的 ID 拼链规则就能直接下载。
      *
      * <p>安全边界不变：slug 或标题归一化后必须与查询词完全相等，且下载后仍要校验
-     * jar 内 modId 或缺口包。
+     * jar 内 modId。
      */
     private Candidate fromCfwidget(String slugQuery, String loader, String mcVersion) {
         LinkedHashSet<String> slugs = new LinkedHashSet<>(directSlugs(slugQuery));

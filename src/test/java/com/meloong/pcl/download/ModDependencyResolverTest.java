@@ -158,29 +158,6 @@ class ModDependencyResolverTest {
         assertTrue(ModDependencyResolver.satisfies("anything", ""));
     }
 
-    /** 类引用扫描的缺口包归属判定。 */
-    @Test
-    void 缺口包归属与分组() throws Exception {
-        var method = ModDependencyResolver.class.getDeclaredMethod("gapPkgOf", String.class);
-        method.setAccessible(true);
-        assertEquals("dev/ftb/mods/ftbquests",
-                method.invoke(null, "dev/ftb/mods/ftbquests/team/Team"));
-        assertEquals("net/exmo/exmodifier/util",
-                method.invoke(null, "net/exmo/exmodifier/util/ExUtil"));
-
-        var owned = ModDependencyResolver.class.getDeclaredMethod("ownedByInstalled", String.class, Set.class);
-        owned.setAccessible(true);
-        Set<String> provided = Set.of("net/exmo/exmodifier/util", "com/github/L_Ender/cataclysm/event");
-        assertTrue((Boolean) owned.invoke(null, "net/exmo/exmodifier/util/ExUtil", provided),
-                "已装 Mod 提供的包不应再算缺口");
-        assertFalse((Boolean) owned.invoke(null, "dev/ftb/mods/ftbquests/team/Team", provided));
-
-        var covered = ModDependencyResolver.class.getDeclaredMethod("coveredBy", String.class, Set.class);
-        covered.setAccessible(true);
-        assertTrue((Boolean) covered.invoke(null, "net/exmo/exmodifier/util", provided));
-        assertFalse((Boolean) covered.invoke(null, "dev/ftb/mods/ftbquests", provided));
-    }
-
     /**
      * 升级判定必须极其保守：version 字段是占位符 ${file.jarVersion} 的 Mod
      * （Cucumber/TerraBlender 实测都是）清洗后是 0，直接比区间会误杀，
